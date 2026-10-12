@@ -9,7 +9,8 @@
 #               if any, prints the required install command(s) and exits so
 #               the user (or an admin) can run them before re-invoking this
 #               script.  On macOS this flag has no effect (Homebrew does not
-#               use sudo).
+#               use sudo; installing the OBS cask may still ask for your
+#               password to write to /Applications).
 #
 # What this script does:
 #   1. Installs OBS Studio, FFmpeg, and Python 3.10+ via the system package
@@ -35,6 +36,8 @@ set -euo pipefail
 
 OBSAPP_REPO="prechelt/obsappliance"
 OBS_MIN_MAJOR=28       # OBS 28+ has obs-websocket 5.x built in
+OBS_MIN_MAJOR_MACOS=30 # OBS 30+ has the macOS sources OBSapp uses
+                       # (screen_capture with display_uuid, macos-avcapture)
 PYTHON_MIN="3.10"
 
 VENV_DIR="$HOME/.local/share/obsapp/venv"
@@ -115,6 +118,7 @@ if [[ "$PLATFORM" == "macos" ]]; then
     if ! command -v brew &>/dev/null; then
         abort "Homebrew is required but not installed.\nInstall it from https://brew.sh and re-run this script."
     fi
+    OBS_MIN_MAJOR=$OBS_MIN_MAJOR_MACOS
 fi
 
 # ── Install system package helper ─────────────────────────────────────────────
@@ -168,18 +172,34 @@ cyan "OBS Studio"
 
 obs_exe=""
 obs_ver=""
+OBS_JUST_INSTALLED=0
 
 find_obs() {
     if [[ "$PLATFORM" == "macos" ]]; then
-        if [[ -x "/Applications/OBS.app/Contents/MacOS/obs" ]]; then
-            obs_exe="/Applications/OBS.app/Contents/MacOS/obs"
-        fi
+        local app
+        for app in "/Applications/OBS.app" "$HOME/Applications/OBS.app"; do
+            if [[ -x "$app/Contents/MacOS/OBS" ]]; then
+                obs_exe="$app/Contents/MacOS/OBS"
+                # Read the version from the bundle: running the binary with
+                # --version may start the GUI instead of printing it.
+                obs_ver=$(defaults read "$app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || true)
+                break
+            fi
+        done
     else
         obs_exe=$(command -v obs 2>/dev/null || true)
+        if [[ -n "$obs_exe" ]]; then
+            obs_ver=$("$obs_exe" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+        fi
     fi
+}
 
-    if [[ -n "$obs_exe" ]]; then
-        obs_ver=$("$obs_exe" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+# obs_update_hint — how to update OBS on this platform (for error messages).
+obs_update_hint() {
+    if [[ "$PLATFORM" == "macos" ]]; then
+        echo "Update OBS with:  brew upgrade --cask obs   (or download it from https://obsproject.com)"
+    else
+        echo "Update OBS via your package manager"
     fi
 }
 
@@ -188,12 +208,13 @@ find_obs
 if [[ -n "$obs_ver" ]] && version_gte "$obs_ver" "$OBS_MIN_MAJOR.0"; then
     yellow "OBS $obs_ver"
 elif [[ -n "$obs_ver" ]]; then
-    abort "OBS $obs_ver is installed but the minimum required version is $OBS_MIN_MAJOR.0.\nPlease update OBS via your package manager and re-run."
+    abort "OBS $obs_ver is installed but the minimum required version is $OBS_MIN_MAJOR.0.\n$(obs_update_hint) and re-run."
 else
     if [[ "$PLATFORM" == "macos" ]]; then
         echo "    installing OBS via Homebrew Cask ..."
+        # May ask for your password: the cask installs into /Applications.
         brew install --cask obs
-        obs_exe="/Applications/OBS.app/Contents/MacOS/obs"
+        OBS_JUST_INSTALLED=1
     else
         case "$PKG_MGR" in
             apt)
@@ -226,7 +247,7 @@ else
         find_obs
         [[ -n "$obs_ver" ]] || abort "OBS was installed but its version could not be determined."
         version_gte "$obs_ver" "$OBS_MIN_MAJOR.0" || \
-            abort "OBS $obs_ver was installed but version >= $OBS_MIN_MAJOR.0 is required.\nUpdate OBS via your package manager and re-run."
+            abort "OBS $obs_ver was installed but version >= $OBS_MIN_MAJOR.0 is required.\n$(obs_update_hint) and re-run."
         green "OBS $obs_ver installed"
     fi
 fi
@@ -283,6 +304,12 @@ find_python() {
             local ver
             ver=$("$exe" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
             if [[ -n "$ver" ]] && version_gte "$ver" "$PYTHON_MIN"; then
+                # OBSapp's GUI needs tkinter.  Homebrew ships it separately
+                # (python-tk@3.x), so on macOS a Python without it is skipped.
+                if [[ "$PLATFORM" == "macos" ]] && ! "$exe" -c "import tkinter" &>/dev/null; then
+                    echo "    note: $exe ($ver) has no tkinter, skipping it"
+                    continue
+                fi
                 python_exe="$exe"
                 return 0
             fi
@@ -296,9 +323,9 @@ if find_python; then
     yellow "Python $py_ver ($python_exe)"
 else
     if [[ "$PLATFORM" == "macos" ]]; then
-        echo "    installing Python via Homebrew ..."
-        brew install python@3.12
-        find_python || abort "Python 3.12 was installed but cannot be found."
+        echo "    installing Python (with tkinter) via Homebrew ..."
+        brew install python@3.12 python-tk@3.12
+        find_python || abort "Python 3.12 with tkinter was installed but cannot be found."
     else
         case "$PKG_MGR" in
             apt)    install_pkg "Python 3.12" python3.12 python3.12 python python3.12
@@ -368,7 +395,6 @@ else
 fi
 
 "$PIP" install --quiet --force-reinstall "$obsapp_url"
-green "$PIP" install --quiet --force-reinstall "$obsapp_url"
 green "OBSapp installed"
 
 # ── Config file ───────────────────────────────────────────────────────────────
@@ -378,10 +404,13 @@ cyan "Configuration"
 mkdir -p "$CONFIG_DIR"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
+    # Write an absolute FFmpeg path: an app started from the Finder or a
+    # desktop menu gets a minimal PATH without e.g. /opt/homebrew/bin.
+    ffmpeg_exe=$(command -v ffmpeg 2>/dev/null || echo ffmpeg)
     cat > "$CONFIG_FILE" <<EOF
 [obsappliance]
 obs_executable    = $obs_exe
-ffmpeg_executable = ffmpeg
+ffmpeg_executable = $ffmpeg_exe
 EOF
     green "Created $CONFIG_FILE"
 else
@@ -404,7 +433,11 @@ green "Created $LAUNCHER"
 # Remind the user if ~/.local/bin is not yet on PATH.
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo "    NOTE: Add $BIN_DIR to your PATH to run 'obsapp' from anywhere."
-    echo "          e.g. add this to ~/.bashrc or ~/.zshrc:"
+    if [[ "$PLATFORM" == "macos" ]]; then
+        echo "          e.g. add this to ~/.zprofile (zsh is the macOS default shell):"
+    else
+        echo "          e.g. add this to ~/.bashrc or ~/.zshrc:"
+    fi
     echo "          export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
@@ -454,16 +487,21 @@ elif [[ "$PLATFORM" == "macos" ]]; then
     res_dir="$app_dir/Contents/Resources"
     mkdir -p "$macos_dir" "$res_dir"
 
-    # Launcher executable inside the bundle
+    # Launcher executable inside the bundle.  An app started from the Finder
+    # has no terminal, so its output goes to a log file; otherwise startup
+    # errors (e.g. a broken config) would be invisible.
+    log_file="$HOME/Library/Logs/OBSapp.log"
     cat > "$macos_dir/obsapp" <<EOF
 #!/usr/bin/env bash
-exec "$PYTHON_VENV" -m obsapp.main "$CONFIG_FILE" "\$@"
+mkdir -p "$(dirname "$log_file")"
+exec "$PYTHON_VENV" -m obsapp.main "$CONFIG_FILE" "\$@" >>"$log_file" 2>&1
 EOF
     chmod +x "$macos_dir/obsapp"
 
     # Convert PNG icon to ICNS using macOS built-in tools (sips + iconutil).
     if [[ -n "$icon_png" ]]; then
-        iconset=$(mktemp -d).iconset
+        iconset_tmp=$(mktemp -d)
+        iconset="$iconset_tmp/obsapp.iconset"   # iconutil needs the .iconset suffix
         mkdir -p "$iconset"
         for size in 16 32 64 128 256 512; do
             sips -z $size $size "$icon_png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
@@ -474,28 +512,43 @@ EOF
         sips -z 512  512  "$icon_png" --out "$iconset/icon_256x256@2x.png" >/dev/null
         sips -z 1024 1024 "$icon_png" --out "$iconset/icon_512x512@2x.png" >/dev/null
         iconutil -c icns "$iconset" -o "$res_dir/obsapp-icon.icns"
-        rm -rf "$iconset"
+        rm -rf "$iconset_tmp"
         icon_key="<key>CFBundleIconFile</key><string>obsapp-icon</string>"
     else
         icon_key=""
     fi
 
-    # Minimal Info.plist
+    obsapp_ver=$("$PYTHON_VENV" -c "import importlib.metadata as m; print(m.version('obsapp'))" 2>/dev/null || echo "1.0")
+
+    # Info.plist.  OBS runs as a child of this app, so macOS attributes OBS's
+    # camera and microphone access to OBSapp and needs the usage descriptions
+    # below to show its permission prompts.
     cat > "$app_dir/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleExecutable</key>  <string>obsapp</string>
-    <key>CFBundleIdentifier</key>  <string>de.prechelt.obsapp</string>
-    <key>CFBundleName</key>        <string>OBSapp</string>
-    <key>CFBundleVersion</key>     <string>1.0</string>
-    <key>LSUIElement</key>         <false/>
+    <key>CFBundleExecutable</key>          <string>obsapp</string>
+    <key>CFBundleIdentifier</key>          <string>de.prechelt.obsapp</string>
+    <key>CFBundleName</key>                <string>OBSapp</string>
+    <key>CFBundlePackageType</key>         <string>APPL</string>
+    <key>CFBundleVersion</key>             <string>$obsapp_ver</string>
+    <key>CFBundleShortVersionString</key>  <string>$obsapp_ver</string>
+    <key>LSUIElement</key>                 <false/>
+    <key>NSCameraUsageDescription</key>
+    <string>OBSapp records your webcam (through OBS Studio).</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>OBSapp records your microphone (through OBS Studio).</string>
     $icon_key
 </dict>
 </plist>
 EOF
+
+    # Ad-hoc sign the bundle so macOS can keep the permissions granted to it
+    # stable across launches.  Not fatal: the app also runs unsigned.
+    codesign --force --sign - "$app_dir" &>/dev/null || \
+        echo "    note: could not sign $app_dir (permissions may be asked again)"
 
     green "Desktop app bundle: ~/Desktop/OBSapp.app"
 
@@ -512,3 +565,22 @@ cat <<EOF
 
 To update OBSapp later, re-run this script (use --current for the main branch).
 EOF
+
+if [[ "$PLATFORM" == "macos" ]]; then
+    cat <<EOF
+
+macOS notes:
+  - The first time you record, macOS asks to allow Screen Recording,
+    Camera, and Microphone access.  Allow them; without Screen Recording
+    access, recordings stay black.  You may need to restart OBSapp afterwards.
+  - Errors from OBSapp started via the desktop icon are logged to
+    ~/Library/Logs/OBSapp.log
+EOF
+    if [[ "$OBS_JUST_INSTALLED" -eq 1 ]]; then
+        cat <<EOF
+  - OBS Studio was just installed.  Open it once from the Applications
+    folder and confirm macOS's "downloaded from the Internet" prompt, then
+    quit it.  OBSapp cannot answer that prompt for you.
+EOF
+    fi
+fi

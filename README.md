@@ -69,20 +69,30 @@ To uninstall, simply delete the entire installation directory and the desktop sh
 
 ### 2.2 Installation on macOS
 
-NOT YET AVAILABLE.
-
 [Homebrew](https://brew.sh) 
 must be installed first.
 
 ```bash
-bash installer/install.sh
+curl -fsSL https://raw.githubusercontent.com/prechelt/obsappliance/main/installer/install.sh | bash
 ```
 
-Installs OBS Studio, FFmpeg, and Python via Homebrew (no sudo needed), or,
-if suitable versions are found in the PATH, uses those.
+Installs OBS Studio (30 or newer), FFmpeg, and Python with tkinter via Homebrew,
+or uses suitable versions that are already installed.
+Installing OBS Studio may ask for your password, because it goes into `/Applications`.
+If OBS Studio was just installed, open it once from the Applications folder,
+confirm macOS's "downloaded from the Internet" prompt, and quit it again.
 
-Installs OBSapp into `~/.local/share/obsapp/venv` and !!!. 
-A launcher is placed at `~/.local/bin/obsapp` and a shortcut at `~/Desktop/OBSapp.app`.
+OBSapp goes into `~/.local/share/obsapp/venv`, its configuration into
+`~/.config/obsapp/obsapp-config.ini`.
+A launcher is placed at `~/.local/bin/obsapp` and an app at `~/Desktop/OBSapp.app`.
+Errors from the app are logged to `~/Library/Logs/OBSapp.log`.
+
+The first time you record, macOS asks to allow Screen Recording, Camera, and
+Microphone access.  Allow them; without Screen Recording access, recordings stay black.
+On macOS, recordings contain the microphone only, not system sound such as notifications.
+
+To uninstall, delete `~/Desktop/OBSapp.app`, `~/.local/bin/obsapp`,
+and the directories `~/.local/share/obsapp` and `~/.config/obsapp`.
 
 ### 2.3 Installation on Linux
 
@@ -149,7 +159,7 @@ For development history, see [docs/changelog.md](docs/changelog.md).
   output path) as a JSON file so the next session starts with sensible values.
 
 - **`os_specifics.py`** — Enumerates monitors, microphones, and webcams via
-  native OS APIs (Win32 COM/ctypes, Linux xrandr/pactl, macOS system_profiler).
+  native OS APIs (Win32 COM/ctypes, Linux xrandr/pactl, macOS CoreGraphics/CoreAudio/system_profiler).
 
 - **`gui/*.py`** — One `CTkFrame` subclass per screen (main menu, record dialog,
   censor dialog, concatenate dialog) plus shared widget helpers.
