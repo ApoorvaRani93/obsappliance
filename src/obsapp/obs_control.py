@@ -34,12 +34,14 @@ from .constants import (
 from .os_specifics import (
     _enum_monitors_win32, _enum_mics_win32, _enum_webcams_win32,
     _enum_monitors_linux, _enum_mics_linux, _enum_webcams_linux,
-    _enum_monitors_darwin, _enum_mics_darwin,
+    _enum_monitors_darwin, _enum_mics_darwin, _enum_webcams_darwin,
 )
 
 # Platform-specific source types and the property name that lists available devices.
-# For Linux monitor capture, _LINUX_MONITOR_CANDIDATES is probed at runtime instead
-# because the correct kind depends on whether OBS is running under X11 or Wayland.
+# For Linux monitor capture and macOS monitor/webcam capture,
+# _LINUX_MONITOR_CANDIDATES and _DARWIN_CANDIDATES are probed at runtime instead
+# because the correct kind depends on the display server (Linux) or the
+# macOS/OBS version (macOS).
 _SOURCE_TYPES = {
     "win32": {
         "monitor": ("monitor_capture", "monitor_id"),
@@ -51,9 +53,7 @@ _SOURCE_TYPES = {
         "webcam": ("v4l2_input", "device_id"),
     },
     "darwin": {
-        "monitor": ("display_capture", "display"),
-        "mic": ("coreaudio_input_capture", "device_id"),
-        "webcam": ("av_capture_input", "device"),
+        "mic":("coreaudio_input_capture", "device_id"),
     },
 }
 
@@ -66,6 +66,27 @@ _LINUX_MONITOR_CANDIDATES: list[tuple[str, str | None]] = [
     ("pipewire-desktop-capture", None),              # Wayland / PipeWire (OBS 28+)
     ("xdg_desktop_portal_desktop_capture", None),   # Wayland / PipeWire (alternate name)
 ]
+
+# macOS source candidates per role, in preference order.
+# Each entry is (kind, device_property, extra_settings).
+# monitor: both sources identify the display by its CoreGraphics UUID.
+#   screen_capture (ScreenCaptureKit, macOS 12.5+) replaces the deprecated
+#   display_capture; "type": 0 selects whole-display capture rather than a
+#   window or application.
+# webcam: both sources identify the camera by its AVFoundation uniqueID.
+#   macos-avcapture (OBS 30+) replaces av_capture_input.  "enable_audio" is
+#   off so a camera's built-in microphone does not add a second audio track
+#   next to the selected microphone.
+_DARWIN_CANDIDATES: dict[str, list[tuple[str, str, dict]]] = {
+    "monitor": [
+        ("screen_capture", "display_uuid", {"type": 0, "show_cursor": True}),
+        ("display_capture", "display_uuid", {"show_cursor": True}),
+    ],
+    "webcam": [
+        ("macos-avcapture", "device", {"enable_audio": False}),
+        ("av_capture_input", "device", {"enable_audio": False}),
+    ],
+}
 
 _SCENE_NAME = "OBSapp_Recording"
 _WS_PORT = 4455
@@ -88,6 +109,7 @@ class OBSController:
         self._platform = "linux" if sys.platform.startswith("linux") else sys.platform
         # Detected at runtime after OBS connects; None until then.
         self._linux_monitor_kind: tuple[str, str | None] | None = None
+        self._darwin_kinds: dict[str, tuple[str, str, dict]] = {}
         self._logfh: IO[str] | None = None
 
     def _log(self, msg: str) -> None:
@@ -108,6 +130,7 @@ class OBSController:
             self.ws = None
             self._process = None
             self._linux_monitor_kind = None
+            self._darwin_kinds = {}
             return False
         return True
 
@@ -174,13 +197,51 @@ class OBSController:
                     self._log(f"OBS version={v.obs_version}  websocket={v.obs_web_socket_version}")
                 except Exception:
                     pass
-                return
+                break
             except Exception:
                 time.sleep(1)
-        raise ConnectionError("Could not connect to OBS websocket after 30 s")
+        else:
+            raise ConnectionError("Could not connect to OBS websocket after 30 s")
+        self._wait_until_ready()
+
+    def _wait_until_ready(self, timeout: float = 30.0) -> None:
+        """Block until OBS has finished loading and accepts requests.
+
+        obs-websocket starts listening while OBS is still loading its scene
+        collection.  Requests sent in that window fail with code 207 ("OBS is
+        not ready to perform the request").
+        """
+        assert self.ws is not None
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                self.ws.get_scene_list()
+                self._log("OBS ready")
+                return
+            except obsws.error.OBSSDKRequestError as exc:
+                if exc.code != 207:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise ConnectionError(
+                        f"OBS did not finish loading within {timeout:.0f} s"
+                    ) from exc
+                self._log("OBS not ready yet (code 207), waiting")
+                time.sleep(0.25)
 
     def stop(self) -> None:
         """Shut down OBS cleanly, falling back to terminate() if needed."""
+        # On macOS, ScreenCaptureKit can still deliver audio to a
+        # screen_capture source while OBS frees it during shutdown, which
+        # crashes OBS (seen with OBS 32.2.2).  Removing our sources first
+        # stops the capture streams before OBS exits.
+        if self.ws is not None and self._platform == "darwin":
+            for name in ("OBSapp_Monitor", "OBSapp_Mic", "OBSapp_Webcam"):
+                try:
+                    self.ws.remove_input(name)
+                except Exception:
+                    pass  # code 600 = not found
+            time.sleep(0.5)  # source removal is asynchronous in OBS
+
         # Close the websocket first.
         if self.ws is not None:
             try:
@@ -194,6 +255,7 @@ class OBSController:
 
         # Ask OBS to exit gracefully via WM_CLOSE so it writes its clean-exit
         # flag and doesn't show the crash-recovery dialog on next launch.
+        # On Linux and macOS, OBS handles SIGTERM itself as a clean shutdown.
         if self._platform == "win32":
             self._close_windows_gracefully()
         else:
@@ -248,7 +310,7 @@ class OBSController:
             if self._platform == "win32":
                 result = _enum_monitors_win32()
             elif self._platform == "darwin":
-                result = _enum_monitors_darwin()
+                result = _enum_monitors_darwin(log=self._log)
             else:
                 result = _enum_monitors_linux(log=self._log)
         except Exception as exc:
@@ -264,7 +326,7 @@ class OBSController:
             if self._platform == "win32":
                 result = _enum_mics_win32()
             elif self._platform == "darwin":
-                result = _enum_mics_darwin()
+                result = _enum_mics_darwin(log=self._log)
             else:
                 result = _enum_mics_linux(log=self._log)
         except Exception as exc:
@@ -279,11 +341,10 @@ class OBSController:
         try:
             if self._platform == "win32":
                 result = _enum_webcams_win32()
-            elif self._platform == "linux":
-                result = _enum_webcams_linux(log=self._log)
+            elif self._platform == "darwin":
+                result = _enum_webcams_darwin(log=self._log)
             else:
-                # macOS webcam enumeration not yet implemented.
-                result = []
+                result = _enum_webcams_linux(log=self._log)
         except Exception as exc:
             self._log(f"webcam enumeration error: {exc}")
             print(f"Webcam enumeration failed: {exc}")
@@ -322,6 +383,33 @@ class OBSController:
         self._linux_monitor_kind = _LINUX_MONITOR_CANDIDATES[0]  # X11 fallback
         self._log(f"falling back to: {self._linux_monitor_kind}")
         return self._linux_monitor_kind
+
+    def _get_darwin_kind(self, role: str) -> tuple[str, str, dict]:
+        """Return the best available (kind, device_prop, extra) for a macOS *role*.
+
+        *role* is a key of _DARWIN_CANDIDATES ("monitor" or "webcam").
+        Queries OBS for its registered input kinds and picks the first match,
+        so this works both with current sources (screen_capture,
+        macos-avcapture) and with older macOS/OBS versions that only offer the
+        legacy ones.  Result is cached per session.
+        """
+        if role in self._darwin_kinds:
+            return self._darwin_kinds[role]
+        candidates = _DARWIN_CANDIDATES[role]
+        try:
+            assert self.ws is not None
+            available = set(self.ws.get_input_kind_list(unversioned=True).input_kinds)
+            self._log(f"input kinds available: {sorted(available)}")
+            for candidate in candidates:
+                if candidate[0] in available:
+                    self._darwin_kinds[role] = candidate
+                    self._log(f"selected {role} kind: {candidate[0]!r}")
+                    return candidate
+        except Exception as exc:
+            self._log(f"_get_darwin_kind({role}) error: {exc}")
+        self._darwin_kinds[role] = candidates[0]
+        self._log(f"{role}: falling back to {candidates[0][0]!r}")
+        return candidates[0]
 
     def setup_recording(
         self,
@@ -380,18 +468,28 @@ class OBSController:
             time.sleep(0.5)
         # Add monitor capture.
         types = _SOURCE_TYPES[self._platform]
+        mon_extra: dict = {}
         if self._platform == "linux":
             mon_kind, mon_prop = self._get_linux_monitor_kind()
+        elif self._platform == "darwin":
+            mon_kind, mon_prop, mon_extra = self._get_darwin_kind("monitor")
         else:
             mon_kind, mon_prop = types["monitor"]
         # On Wayland (PipeWire sources), there is no screen-ID property; the
         # user selects the screen via the XDG portal dialog that OBS opens.
         mon_settings = {mon_prop: monitor_value} if mon_prop is not None else {}
+        mon_settings.update(mon_extra)
         self._log(f"create_input monitor: kind={mon_kind!r} settings={mon_settings!r}")
         self.ws.create_input(
             _SCENE_NAME, "OBSapp_Monitor", mon_kind, mon_settings, True,
         )
         self._log("create_input monitor: OK")
+        # macOS screen capture also captures system audio (notifications,
+        # videos, ...) and has no setting to turn that off.  Mute the source so
+        # recordings contain the microphone only, as on Windows and Linux.
+        if self._platform == "darwin":
+            self.ws.set_input_mute("OBSapp_Monitor", True)
+            self._log("monitor source muted (no system audio)")
         # Add microphone (if selected).
         if mic_value:
             mic_kind, mic_prop = types["mic"]
@@ -404,11 +502,15 @@ class OBSController:
             self._add_mic_filters("OBSapp_Mic")
         # Add webcam (if selected).
         if webcam_value:
-            cam_kind, cam_prop = types["webcam"]
-            self._log(f"create_input webcam: kind={cam_kind!r} {cam_prop}={webcam_value!r}")
+            cam_extra: dict = {}
+            if self._platform == "darwin":
+                cam_kind, cam_prop, cam_extra = self._get_darwin_kind("webcam")
+            else:
+                cam_kind, cam_prop = types["webcam"]
+            cam_settings = {cam_prop: webcam_value, **cam_extra}
+            self._log(f"create_input webcam: kind={cam_kind!r} settings={cam_settings!r}")
             result = self.ws.create_input(
-                _SCENE_NAME, "OBSapp_Webcam", cam_kind,
-                {cam_prop: webcam_value}, True,
+                _SCENE_NAME, "OBSapp_Webcam", cam_kind, cam_settings, True,
             )
             self._log("create_input webcam: OK")
             if webcam_transform is not None:
@@ -443,12 +545,26 @@ class OBSController:
         self.ws.start_record()
         self._log("start_record: OK")
 
-    def stop_recording(self) -> str:
-        """Stop recording.  Returns the path of the recorded file."""
+    def stop_recording(self, timeout: float = 15.0) -> str:
+        """Stop recording.  Returns the path of the recorded file.
+
+        StopRecord returns before OBS has finished writing the file.  Wait
+        until the record output is inactive, so that the file is complete and
+        stop() cannot remove the sources while the last frames are still being
+        rendered (which shows up as a black final frame).
+        """
         assert self.ws is not None
         self._log("stop_record")
         resp = self.ws.stop_record()
         self._log(f"stop_record: output_path={resp.output_path!r}")
+        deadline = time.monotonic() + timeout
+        while self.ws.get_record_status().output_active:
+            if time.monotonic() >= deadline:
+                self._log(f"record output still active after {timeout:.0f} s")
+                break
+            time.sleep(0.1)
+        else:
+            self._log("record output stopped")
         return resp.output_path
 
     def pause_recording(self) -> None:
@@ -514,7 +630,7 @@ class OBSController:
         if not ini.exists():
             ini.write_text(
                 "[General]\n"
-                "Name = OBSapp\n"
+                "Name=OBSapp\n"
                 "\n"
                 "[Video]\n"
                 "FPSType=2\n"
@@ -606,18 +722,43 @@ class OBSController:
         else:
             self._log(f"global.ini already exists: {gi}")
             # Ensure FirstRun is false even if a previous OBS launch set it.
-            parser = configparser.RawConfigParser()
-            parser.optionxform = str  # preserve key case
-            parser.read(gi)
-            if not parser.has_section("General"):
-                parser.add_section("General")
-            if parser.get("General", "FirstRun", fallback="false").lower() != "false":
-                parser.set("General", "FirstRun", "false")
-                with gi.open("w") as fh:
-                    parser.write(fh)
-                self._log("global.ini: patched FirstRun=false")
-            else:
-                self._log("global.ini: FirstRun already false")
+            self._set_ini_value(gi, "General", "FirstRun", "false")
+        # OBS 31+ moved per-user settings, FirstRun included, from global.ini
+        # to user.ini, and creates user.ini with FirstRun=true.
+        ui = cfg / "user.ini"
+        self._set_ini_value(ui, "General", "FirstRun", "false")
+
+        # ── macOS: suppress the startup permissions dialog ──
+        # When screen capture, camera, or microphone permission is missing,
+        # OBS on macOS shows a modal permissions dialog at startup.  Like the
+        # first-run wizard, it blocks obs-websocket until dismissed, so
+        # start() times out.  OBS skips the dialog once
+        # MacOSPermissionsDialogLastShown is set; OBS 31+ reads it from
+        # user.ini, older versions from global.ini.  macOS still shows its own
+        # system prompt when a capture source is created.
+        if self._platform == "darwin":
+            for ini_path in (gi, ui):
+                self._set_ini_value(
+                    ini_path, "General", "MacOSPermissionsDialogLastShown", "1",
+                )
+
+    def _set_ini_value(self, path: Path, section: str, key: str, value: str) -> None:
+        """Set *key* in *section* of the OBS ini file *path*, creating it if needed."""
+        parser = configparser.RawConfigParser(strict=False)
+        parser.optionxform = str  # preserve key case (OBS is case-sensitive)
+        if path.exists():
+            parser.read(path, encoding="utf-8-sig")
+        if not parser.has_section(section):
+            parser.add_section(section)
+        if parser.get(section, key, fallback=None) == value:
+            self._log(f"{path.name}: {key} already {value}")
+            return
+        parser.set(section, key, value)
+        # OBS's ini parser does not strip whitespace around "=", so
+        # "key = value" would be read as a different key than "key".
+        with path.open("w", encoding="utf-8") as fh:
+            parser.write(fh, space_around_delimiters=False)
+        self._log(f"{path.name}: set {key}={value}")
 
     def _create_scene_if_missing(self, name: str) -> None:
         """Create an OBS scene, silently ignoring 'already exists' (code 601)."""
@@ -711,7 +852,7 @@ class OBSController:
             fps_den = 1
         self._log(f"fps from ini: {fps_num}/{fps_den}")
         with prof_ini.open("w", encoding="utf-8-sig") as fh:
-            cfg.write(fh)
+            cfg.write(fh, space_around_delimiters=False)  # see _set_ini_value
         self._log("profile ini written")
         # Push to the running OBS session via websocket so we don't need a restart.
         self.ws.set_video_settings(

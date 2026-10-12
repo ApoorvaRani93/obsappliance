@@ -114,10 +114,20 @@ class App(ctk.CTk):
             )
             loading.pack(padx=PADDING, pady=PADDING)
             hint = None
+            hint_text = None
             if sys.platform.startswith("linux"):
+                hint_text = "An OBS Studio window will open.\nMinimize it, but do not close it\n— OBSapp relies on that process."
+            elif sys.platform == "darwin":
+                hint_text = (
+                    "An OBS Studio window will open.\nMinimize it, but do not close it\n"
+                    "— OBSapp relies on that process.\n\n"
+                    "If macOS asks for Screen Recording permission, allow it.\n"
+                    "Without it, recordings stay black."
+                )
+            if hint_text is not None:
                 hint = ctk.CTkLabel(
                     self,
-                    text="An OBS Studio window will open.\nMinimize it, but do not close it\n— OBSapp relies on that process.",
+                    text=hint_text,
                     font=ctk.CTkFont(size=12),
                     justify="left",
                 )

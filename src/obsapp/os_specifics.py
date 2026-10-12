@@ -596,43 +596,275 @@ def _enum_webcams_linux(log=None) -> list[tuple[str, str]]:
 # macOS
 # ---------------------------------------------------------------------------
 
-def _enum_monitors_darwin() -> list[tuple[str, str, int, int]]:
-    """Return monitor list on macOS using system_profiler."""
-    try:
-        out = subprocess.check_output(
-            ["system_profiler", "SPDisplaysDataType"], text=True,
-            stderr=subprocess.DEVNULL,
+def _enum_monitors_darwin(log=None) -> list[tuple[str, str, int, int]]:
+    """Return [(display_name, display_uuid, width, height), ...] via CoreGraphics.
+
+    The display UUID (e.g. "37D8832A-2D66-02CA-B9F7-8F30A301B230") is the
+    value OBS's screen_capture and display_capture sources expect for their
+    "display_uuid" property.  Width and height are the display mode's
+    **physical** pixel dimensions (twice the point size on Retina displays),
+    which is what OBS captures.  The @x,y offset in the label is in global
+    display coordinates, which macOS measures in points.
+    """
+    import ctypes
+
+    _l = log or (lambda msg: None)
+
+    cg = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+    )
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+
+    class CGPoint(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+    class CGSize(ctypes.Structure):
+        _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+    class CGRect(ctypes.Structure):
+        _fields_ = [("origin", CGPoint), ("size", CGSize)]
+
+    cg.CGGetActiveDisplayList.restype = ctypes.c_int32
+    cg.CGGetActiveDisplayList.argtypes = [
+        ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    cg.CGDisplayBounds.restype = CGRect
+    cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+    cg.CGDisplayIsMain.restype = ctypes.c_uint32
+    cg.CGDisplayIsMain.argtypes = [ctypes.c_uint32]
+    cg.CGDisplayCopyDisplayMode.restype = ctypes.c_void_p
+    cg.CGDisplayCopyDisplayMode.argtypes = [ctypes.c_uint32]
+    cg.CGDisplayModeGetPixelWidth.restype = ctypes.c_size_t
+    cg.CGDisplayModeGetPixelWidth.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeGetPixelHeight.restype = ctypes.c_size_t
+    cg.CGDisplayModeGetPixelHeight.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeRelease.restype = None
+    cg.CGDisplayModeRelease.argtypes = [ctypes.c_void_p]
+
+    # CGDisplayCreateUUIDFromDisplayID moved from CoreGraphics to ColorSync
+    # in macOS 10.13; ColorSync still exports it on all supported versions.
+    create_uuid = None
+    for fw in ("ColorSync", "CoreGraphics"):
+        try:
+            lib = ctypes.CDLL(f"/System/Library/Frameworks/{fw}.framework/{fw}")
+            create_uuid = lib.CGDisplayCreateUUIDFromDisplayID
+            break
+        except (OSError, AttributeError):
+            _l(f"CGDisplayCreateUUIDFromDisplayID not in {fw}")
+    if create_uuid is None:
+        raise RuntimeError("CGDisplayCreateUUIDFromDisplayID not available")
+    create_uuid.restype = ctypes.c_void_p
+    create_uuid.argtypes = [ctypes.c_uint32]
+
+    cf.CFUUIDCreateString.restype = ctypes.c_void_p
+    cf.CFUUIDCreateString.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFStringGetCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+    ]
+    cf.CFRelease.restype = None
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    kCFStringEncodingUTF8 = 0x08000100
+
+    def _uuid_str(display_id: int) -> str:
+        cfuuid = create_uuid(display_id)
+        if not cfuuid:
+            return ""
+        try:
+            cfstr = cf.CFUUIDCreateString(None, cfuuid)
+            try:
+                buf = ctypes.create_string_buffer(64)
+                if not cf.CFStringGetCString(cfstr, buf, len(buf),
+                                             kCFStringEncodingUTF8):
+                    return ""
+                return buf.value.decode("ascii")
+            finally:
+                cf.CFRelease(cfstr)
+        finally:
+            cf.CFRelease(cfuuid)
+
+    max_displays = 32
+    ids = (ctypes.c_uint32 * max_displays)()
+    count = ctypes.c_uint32()
+    err = cg.CGGetActiveDisplayList(max_displays, ids, ctypes.byref(count))
+    if err != 0:
+        raise RuntimeError(f"CGGetActiveDisplayList failed (error {err})")
+    _l(f"CGGetActiveDisplayList: {count.value} displays")
+
+    monitors: list[tuple[str, str, int, int]] = []
+    for i in range(count.value):
+        display_id = ids[i]
+        bounds = cg.CGDisplayBounds(display_id)
+        mode = cg.CGDisplayCopyDisplayMode(display_id)
+        if mode:
+            w = cg.CGDisplayModeGetPixelWidth(mode)
+            h = cg.CGDisplayModeGetPixelHeight(mode)
+            cg.CGDisplayModeRelease(mode)
+        else:
+            # No mode (should not happen for an active display): fall back
+            # to the point size, which is correct on non-Retina displays.
+            w, h = int(bounds.size.width), int(bounds.size.height)
+            _l(f"display {display_id}: no display mode, using point size")
+        uuid = _uuid_str(display_id)
+        if not uuid:
+            _l(f"display {display_id}: no UUID, skipping")
+            continue
+        x, y = int(bounds.origin.x), int(bounds.origin.y)
+        label = f"Monitor {len(monitors) + 1}: {w}×{h} @ {x},{y}"
+        if cg.CGDisplayIsMain(display_id):
+            label += " (primary)"
+        _l(f"display {display_id}: {label}  uuid={uuid}")
+        monitors.append((label, uuid, w, h))
+    return monitors
+
+
+def _enum_mics_darwin(log=None) -> list[tuple[str, str]]:
+    """Return [(friendly_name, device_uid), ...] for CoreAudio input devices.
+
+    The device UID (e.g. "BuiltInMicrophoneDevice") is the value OBS's
+    coreaudio_input_capture source expects for its "device_id" property.
+    Only devices with at least one input stream are returned, so output-only
+    devices such as speakers are skipped.
+    """
+    import ctypes
+
+    _l = log or (lambda msg: None)
+
+    ca = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
+    )
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+
+    def _fourcc(s: str) -> int:
+        return int.from_bytes(s.encode("ascii"), "big")
+
+    class AudioObjectPropertyAddress(ctypes.Structure):
+        _fields_ = [
+            ("mSelector", ctypes.c_uint32),
+            ("mScope",    ctypes.c_uint32),
+            ("mElement",  ctypes.c_uint32),
+        ]
+
+    kAudioObjectSystemObject = 1
+    kAudioHardwarePropertyDevices = _fourcc("dev#")
+    kAudioDevicePropertyDeviceUID = _fourcc("uid ")
+    kAudioObjectPropertyName = _fourcc("lnam")
+    kAudioDevicePropertyStreams = _fourcc("stm#")
+    kAudioObjectPropertyScopeGlobal = _fourcc("glob")
+    kAudioObjectPropertyScopeInput = _fourcc("inpt")
+    kAudioObjectPropertyElementMain = 0
+
+    ca.AudioObjectGetPropertyDataSize.restype = ctypes.c_int32
+    ca.AudioObjectGetPropertyDataSize.argtypes = [
+        ctypes.c_uint32, ctypes.POINTER(AudioObjectPropertyAddress),
+        ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
+    ]
+    ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
+    ca.AudioObjectGetPropertyData.argtypes = [
+        ctypes.c_uint32, ctypes.POINTER(AudioObjectPropertyAddress),
+        ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    ]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFStringGetCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+    ]
+    cf.CFRelease.restype = None
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    kCFStringEncodingUTF8 = 0x08000100
+
+    def _addr(selector: int, scope: int) -> AudioObjectPropertyAddress:
+        return AudioObjectPropertyAddress(
+            selector, scope, kAudioObjectPropertyElementMain,
         )
-    except Exception:
-        return []
-    results = []
-    idx = 0
-    for line in out.splitlines():
-        m = re.match(r"\s+Resolution:\s+(\d+)\s*x\s*(\d+)", line)
-        if m:
-            w, h = int(m.group(1)), int(m.group(2))
-            results.append((f"Display {idx + 1}: {w}×{h}", str(idx), w, h))
-            idx += 1
+
+    def _data_size(obj: int, addr: AudioObjectPropertyAddress) -> int:
+        size = ctypes.c_uint32(0)
+        err = ca.AudioObjectGetPropertyDataSize(
+            obj, ctypes.byref(addr), 0, None, ctypes.byref(size),
+        )
+        return size.value if err == 0 else 0
+
+    def _cfstring_prop(obj: int, selector: int) -> str:
+        addr = _addr(selector, kAudioObjectPropertyScopeGlobal)
+        ref = ctypes.c_void_p()
+        size = ctypes.c_uint32(ctypes.sizeof(ref))
+        err = ca.AudioObjectGetPropertyData(
+            obj, ctypes.byref(addr), 0, None, ctypes.byref(size),
+            ctypes.byref(ref),
+        )
+        if err != 0 or not ref.value:
+            return ""
+        try:
+            buf = ctypes.create_string_buffer(512)
+            if not cf.CFStringGetCString(ref, buf, len(buf), kCFStringEncodingUTF8):
+                return ""
+            return buf.value.decode("utf-8", errors="replace")
+        finally:
+            cf.CFRelease(ref)
+
+    devices_addr = _addr(kAudioHardwarePropertyDevices,
+                         kAudioObjectPropertyScopeGlobal)
+    size = _data_size(kAudioObjectSystemObject, devices_addr)
+    count = size // ctypes.sizeof(ctypes.c_uint32)
+    ids = (ctypes.c_uint32 * count)()
+    size_var = ctypes.c_uint32(size)
+    err = ca.AudioObjectGetPropertyData(
+        kAudioObjectSystemObject, ctypes.byref(devices_addr), 0, None,
+        ctypes.byref(size_var), ids,
+    )
+    if err != 0:
+        raise RuntimeError(f"AudioObjectGetPropertyData(devices) failed (error {err})")
+    _l(f"CoreAudio: {count} audio devices")
+
+    results: list[tuple[str, str]] = []
+    for device_id in ids:
+        name = _cfstring_prop(device_id, kAudioObjectPropertyName)
+        input_streams = _data_size(
+            device_id,
+            _addr(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput),
+        )
+        if not input_streams:
+            _l(f"audio device {device_id} {name!r}: no input streams, skipping")
+            continue
+        uid = _cfstring_prop(device_id, kAudioDevicePropertyDeviceUID)
+        if not uid:
+            _l(f"audio device {device_id} {name!r}: no UID, skipping")
+            continue
+        _l(f"audio device {device_id} {name!r}: input  uid={uid}")
+        results.append((name or uid, uid))
     return results
 
 
-def _enum_mics_darwin() -> list[tuple[str, str]]:
-    """Return microphone list on macOS using system_profiler."""
-    try:
-        out = subprocess.check_output(
-            ["system_profiler", "SPAudioDataType"], text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        return []
-    results = []
-    in_input = False
-    for line in out.splitlines():
-        if "Input" in line and ":" in line:
-            in_input = True
-        elif in_input and line.strip().endswith(":"):
-            name = line.strip().rstrip(":")
-            results.append((name, name))
-        elif line.strip() == "":
-            in_input = False
+def _enum_webcams_darwin(log=None) -> list[tuple[str, str]]:
+    """Return [(friendly_name, unique_id), ...] for cameras via system_profiler.
+
+    The unique ID (e.g. "EAB7A68F-EC2B-4487-AADF-D8A91C1CB782") is the
+    AVFoundation ``uniqueID`` that OBS's macos-avcapture and av_capture_input
+    sources expect for their "device" property.  The JSON output is used
+    because, unlike the text output, its structure is stable.
+    """
+    import json
+
+    _l = log or (lambda msg: None)
+    out = subprocess.check_output(
+        ["system_profiler", "-json", "SPCameraDataType"], text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    cameras = json.loads(out).get("SPCameraDataType", [])
+    _l(f"system_profiler SPCameraDataType: {len(cameras)} cameras")
+    results: list[tuple[str, str]] = []
+    for cam in cameras:
+        name = cam.get("_name", "")
+        uid = cam.get("spcamera_unique-id", "")
+        if not uid:
+            _l(f"camera {name!r}: no unique ID, skipping")
+            continue
+        _l(f"camera {name!r}: uid={uid}")
+        results.append((name or uid, uid))
     return results
